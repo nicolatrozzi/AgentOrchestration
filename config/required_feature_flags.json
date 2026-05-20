@@ -1,0 +1,29 @@
+[
+  {
+    "name": "strict_scheduler_worker_contract",
+    "default": true,
+    "owner": "orchestrator-platform",
+    "description": "Keeps scheduler and worker task-contract checks enabled during production rollout.",
+    "services": ["scheduler", "worker"],
+    "required": true,
+    "enforce_default": true
+  },
+  {
+    "name": "durable_completion_events",
+    "default": true,
+    "owner": "runtime-platform",
+    "description": "Requires durable task state to be recorded before completion side effects are emitted.",
+    "services": ["scheduler", "worker"],
+    "required": true,
+    "enforce_default": true
+  },
+  {
+    "name": "safe_callback_registration",
+    "default": true,
+    "owner": "api-platform",
+    "description": "Requires integration callback URLs to pass shared service validation before registration.",
+    "services": ["api"],
+    "required": true,
+    "enforce_default": true
+  }
+]
