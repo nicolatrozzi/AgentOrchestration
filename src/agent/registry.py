@@ -1,10 +1,15 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
 import json
+import logging
 import time
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 
 class AgentStatus(Enum):
@@ -14,6 +19,7 @@ class AgentStatus(Enum):
     STOPPED = "stopped"
     FAILED = "failed"
     TERMINATED = "terminated"
+    DISABLED = "disabled"
 
 
 class AgentRegistry:
@@ -21,16 +27,31 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._list_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._audit_events: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
+        config = config or {}
+        disabled = self._is_disabled_config(config)
         self._agents[agent_id] = {
             "id": agent_id,
             "name": name,
             "type": agent_type,
-            "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "status": (
+                AgentStatus.DISABLED.value
+                if disabled
+                else AgentStatus.PENDING.value
+            ),
+            "disabled": disabled,
+            "enabled": not disabled,
+            "config": config,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -40,25 +61,95 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_list_cache("agent_registered", agent_id)
+        if disabled:
+            self._record_audit(
+                "disabled_agent_registered",
+                self._agents[agent_id],
+                reason="config_disabled",
+            )
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def resolve(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        agent = self.get(agent_id)
+        if not agent:
+            return None
+        if self._agent_is_disabled(agent):
+            self._record_audit("disabled_agent_resolution_rejected", agent)
+            metrics.increment("registry.disabled_resolution_rejected")
+            return None
+        return agent
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+        include_disabled: bool = False,
+    ) -> List[Dict[str, Any]]:
+        cache_key = self._list_cache_key(status, group, include_disabled)
+        if cache_key in self._list_cache:
+            return [dict(agent) for agent in self._list_cache[cache_key]]
+
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
         if group:
             agent_ids = self._index.get(group, [])
             agents = [a for a in agents if a["id"] in agent_ids]
+        if not include_disabled:
+            visible_agents = [
+                a for a in agents if not self._agent_is_disabled(a)
+            ]
+            filtered_count = len(agents) - len(visible_agents)
+            if filtered_count:
+                self._record_listing_filter(group, filtered_count)
+                metrics.increment(
+                    "registry.disabled_entries_filtered",
+                    filtered_count,
+                )
+            agents = visible_agents
+        agents = [dict(agent) for agent in agents]
+        self._list_cache[cache_key] = agents
         return list(agents)
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
+        agent = self._agents[agent_id]
+        if (
+            self._agent_is_disabled(agent)
+            and status is not AgentStatus.DISABLED
+        ):
+            self._record_audit(
+                "disabled_agent_status_rejected",
+                agent,
+                requested_status=status.value,
+            )
+            metrics.increment("registry.disabled_status_rejected")
+            return False
         self._agents[agent_id]["status"] = status.value
+        self._agents[agent_id]["disabled"] = status is AgentStatus.DISABLED
+        self._agents[agent_id]["enabled"] = status is not AgentStatus.DISABLED
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_list_cache("status_changed", agent_id)
+        return True
+
+    def set_enabled(self, agent_id: str, enabled: bool) -> bool:
+        if agent_id not in self._agents:
+            return False
+        agent = self._agents[agent_id]
+        agent["enabled"] = bool(enabled)
+        agent["disabled"] = not enabled
+        if not enabled:
+            agent["status"] = AgentStatus.DISABLED.value
+            self._record_audit("agent_disabled", agent)
+        elif agent["status"] == AgentStatus.DISABLED.value:
+            agent["status"] = AgentStatus.PENDING.value
+        agent["updated_at"] = time.time()
+        self._invalidate_list_cache("enabled_changed", agent_id)
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +159,91 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_list_cache("agent_deleted", agent_id)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._audit_events]
+
+    @staticmethod
+    def _is_disabled_config(config: Dict[str, Any]) -> bool:
+        return bool(config.get("disabled") or config.get("enabled") is False)
+
+    @staticmethod
+    def _agent_is_disabled(agent: Dict[str, Any]) -> bool:
+        config = agent.get("config") or {}
+        return bool(
+            agent.get("disabled")
+            or agent.get("enabled") is False
+            or agent.get("status") == AgentStatus.DISABLED.value
+            or config.get("disabled") is True
+            or config.get("enabled") is False
+        )
+
+    @staticmethod
+    def _list_cache_key(
+        status: Optional[AgentStatus],
+        group: Optional[str],
+        include_disabled: bool,
+    ) -> str:
+        return json.dumps(
+            {
+                "status": status.value if status else None,
+                "group": group,
+                "include_disabled": include_disabled,
+            },
+            sort_keys=True,
+        )
+
+    def _invalidate_list_cache(
+        self,
+        reason: str,
+        agent_id: Optional[str] = None,
+    ) -> None:
+        if self._list_cache:
+            self._audit_events.append(
+                {
+                    "event": "registry_listing_cache_invalidated",
+                    "reason": reason,
+                    "agent_id": agent_id,
+                    "timestamp": time.time(),
+                }
+            )
+        self._list_cache.clear()
+
+    def _record_listing_filter(
+        self,
+        group: Optional[str],
+        filtered_count: int,
+    ) -> None:
+        event = {
+            "event": "disabled_agents_filtered_from_listing",
+            "group": group,
+            "filtered_count": filtered_count,
+            "timestamp": time.time(),
+        }
+        self._audit_events.append(event)
+        logger.info("disabled agents filtered from listing", extra=event)
+
+    def _record_audit(
+        self,
+        event: str,
+        agent: Dict[str, Any],
+        **metadata: Any,
+    ) -> None:
+        record = {
+            "event": event,
+            "agent_id": agent["id"],
+            "agent_type": agent["type"],
+            "status": agent["status"],
+            "timestamp": time.time(),
+        }
+        record.update(metadata)
+        self._audit_events.append(record)
+        logger.info(event, extra=record)
 
 # 2019-01-29T11:24:49 update
 

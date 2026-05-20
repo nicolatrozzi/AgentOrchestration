@@ -1,5 +1,7 @@
-import pytest
+import logging
+
 from src.agent.registry import AgentRegistry, AgentStatus
+from src.common.metrics import metrics
 
 
 class TestAgentRegistry:
@@ -33,6 +35,92 @@ class TestAgentRegistry:
         self.registry.register("agent-2", "monitor.watcher")
         workers = self.registry.list(group="worker")
         assert len(workers) == 1
+
+    def test_list_agents_hides_disabled_entries_by_default(self):
+        enabled_id = self.registry.register("agent-1", "worker.processor")
+        disabled_id = self.registry.register(
+            "agent-2",
+            "worker.disabled",
+            {"enabled": False},
+        )
+
+        visible_agents = self.registry.list(group="worker")
+        assert [agent["id"] for agent in visible_agents] == [enabled_id]
+
+        all_agents = self.registry.list(
+            group="worker",
+            include_disabled=True,
+        )
+        assert {agent["id"] for agent in all_agents} == {
+            enabled_id,
+            disabled_id,
+        }
+
+        assert self.registry.list(status=AgentStatus.DISABLED) == []
+        disabled_agents = self.registry.list(
+            status=AgentStatus.DISABLED,
+            include_disabled=True,
+        )
+        assert [agent["id"] for agent in disabled_agents] == [disabled_id]
+
+    def test_disabled_agent_status_update_is_rejected(self, caplog):
+        agent_id = self.registry.register(
+            "agent-1",
+            "worker.processor",
+            {"disabled": True},
+        )
+
+        with caplog.at_level(logging.INFO, logger="src.agent.registry"):
+            assert not self.registry.update_status(
+                agent_id,
+                AgentStatus.RUNNING,
+            )
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.DISABLED.value
+        assert agent["disabled"] is True
+        assert "disabled_agent_status_rejected" in caplog.text
+
+    def test_list_cache_invalidates_when_agent_is_disabled(self):
+        first_id = self.registry.register("agent-1", "worker.processor")
+        second_id = self.registry.register("agent-2", "worker.analyzer")
+
+        worker_ids = {
+            agent["id"] for agent in self.registry.list(group="worker")
+        }
+        assert worker_ids == {
+            first_id,
+            second_id,
+        }
+
+        assert self.registry.update_status(second_id, AgentStatus.DISABLED)
+        visible_ids = [
+            agent["id"] for agent in self.registry.list(group="worker")
+        ]
+        assert visible_ids == [first_id]
+        assert any(
+            event["event"] == "registry_listing_cache_invalidated"
+            for event in self.registry.audit_events()
+        )
+
+    def test_resolve_rejects_disabled_agent_with_audit_and_metric(self):
+        agent_id = self.registry.register(
+            "agent-1",
+            "worker.processor",
+            {"disabled": True},
+        )
+        metric_name = "registry.disabled_resolution_rejected"
+        before = metrics.snapshot()["counters"].get(metric_name, 0)
+
+        assert self.registry.resolve(agent_id) is None
+
+        after = metrics.snapshot()["counters"].get(metric_name, 0)
+        assert after == before + 1
+        assert any(
+            event["event"] == "disabled_agent_resolution_rejected"
+            and event["agent_id"] == agent_id
+            for event in self.registry.audit_events()
+        )
 
     def test_update_status(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
