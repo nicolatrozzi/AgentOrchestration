@@ -1,0 +1,8 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: agent-orchestrator:local
+    ports:
+      - "8000:8000"

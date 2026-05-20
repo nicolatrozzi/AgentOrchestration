@@ -27,3 +27,30 @@ jobs:
         run: uv run pytest --cov=src tests/
       - name: Lint
         run: uv run flake8 src/ tests/
+
+  docker-metadata:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image with build-only sentinel args
+        env:
+          AO_BUILD_SENTINEL: metadata-audit-build-secret
+        run: |
+          docker build \
+            --no-cache \
+            --build-arg AO_BUILD_CONFIG="$AO_BUILD_SENTINEL" \
+            --build-arg AO_BUILD_TOKEN="$AO_BUILD_SENTINEL" \
+            --build-arg AO_PACKAGE_INDEX_URL="$AO_BUILD_SENTINEL" \
+            -t agent-orchestrator:metadata-audit \
+            .
+      - name: Audit final image history and labels
+        env:
+          AO_BUILD_SENTINEL: metadata-audit-build-secret
+        run: |
+          python scripts/audit_docker_metadata.py \
+            --image agent-orchestrator:metadata-audit \
+            --forbidden "$AO_BUILD_SENTINEL" \
+            --forbidden AO_BUILD_CONFIG \
+            --forbidden AO_BUILD_TOKEN \
+            --forbidden AO_PACKAGE_INDEX_URL
